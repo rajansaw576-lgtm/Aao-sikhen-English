@@ -23,8 +23,8 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Accept Android SDK licenses
-        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
       - name: Install npm dependencies
         run: npm install
@@ -34,19 +34,135 @@ jobs:
           npx cap add android || true
           npx cap sync android
 
-      - name: Generate keystore
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      - name: Apply custom app icon
         run: |
-          keytool -genkeypair -v \
-            -keystore android/app/release.keystore \
-            -alias "$KEY_ALIAS" \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass "$KEYSTORE_PASSWORD" \
-            -keypass "$KEY_PASSWORD" \
-            -dname "CN=Aao Seekho English, O=Aao Seekho, C=IN"
+          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            cp icon-$d.png android/app/src/main/res/mipmap-$d/ic_launcher.png
+            cp icon-$d.png android/app/src/main/res/mipmap-$d/ic_launcher_round.png
+          done
+
+      - name: Add AdMob dependency to build.gradle
+        run: |
+          python3 - << 'PYEOF'
+          path = "android/app/build.gradle"
+          with open(path) as f:
+              content = f.read()
+          marker = "dependencies {"
+          idx = content.index(marker) + len(marker)
+          content = content[:idx] + "\n    implementation 'com.google.android.gms:play-services-ads:23.6.0'" + content[idx:]
+          with open(path, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: Add AdMob App ID to AndroidManifest.xml
+        run: |
+          python3 - << 'PYEOF'
+          path = "android/app/src/main/AndroidManifest.xml"
+          with open(path) as f:
+              content = f.read()
+          meta = '        <meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" android:value="ca-app-pub-1493112125477027~9352723284"/>\n'
+          content = content.replace("</application>", meta + "    </application>", 1)
+          with open(path, "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: Write MainActivity.java with real ad code
+        run: |
+          MAIN_ACTIVITY=$(find android/app/src/main/java -name "MainActivity.java")
+          PACKAGE_LINE=$(head -n 1 "$MAIN_ACTIVITY")
+          cat > "$MAIN_ACTIVITY" << JAVAEOF
+          $PACKAGE_LINE
+
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.view.ViewGroup;
+          import android.webkit.JavascriptInterface;
+          import android.widget.FrameLayout;
+          import androidx.annotation.NonNull;
+          import com.getcapacitor.BridgeActivity;
+          import com.google.android.gms.ads.AdRequest;
+          import com.google.android.gms.ads.AdSize;
+          import com.google.android.gms.ads.AdView;
+          import com.google.android.gms.ads.MobileAds;
+          import com.google.android.gms.ads.interstitial.InterstitialAd;
+          import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback;
+          import com.google.android.gms.ads.rewarded.RewardedAd;
+          import com.google.android.gms.ads.rewarded.RewardedAdLoadCallback;
+
+          public class MainActivity extends BridgeActivity {
+              private InterstitialAd interstitialAd;
+              private RewardedAd rewardedAd;
+
+              private static final String BANNER_ID = "ca-app-pub-1493112125477027/2647803420";
+              private static final String INTERSTITIAL_ID = "ca-app-pub-1493112125477027/3904955481";
+              private static final String REWARDED_ID = "ca-app-pub-1493112125477027/5172885252";
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  MobileAds.initialize(this, initStatus -> {});
+                  this.bridge.getWebView().addJavascriptInterface(new AdBridge(), "NativeAdBridge");
+                  loadBanner();
+                  loadInterstitial();
+                  loadRewarded();
+              }
+
+              private void loadBanner() {
+                  AdView bannerAdView = new AdView(this);
+                  bannerAdView.setAdUnitId(BANNER_ID);
+                  bannerAdView.setAdSize(AdSize.BANNER);
+                  FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
+                          FrameLayout.LayoutParams.WRAP_CONTENT,
+                          FrameLayout.LayoutParams.WRAP_CONTENT);
+                  params.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+                  ViewGroup rootView = findViewById(android.R.id.content);
+                  rootView.addView(bannerAdView, params);
+                  bannerAdView.loadAd(new AdRequest.Builder().build());
+              }
+
+              private void loadInterstitial() {
+                  InterstitialAd.load(this, INTERSTITIAL_ID, new AdRequest.Builder().build(),
+                      new InterstitialAdLoadCallback() {
+                          @Override
+                          public void onAdLoaded(@NonNull InterstitialAd ad) {
+                              interstitialAd = ad;
+                          }
+                      });
+              }
+
+              private void loadRewarded() {
+                  RewardedAd.load(this, REWARDED_ID, new AdRequest.Builder().build(),
+                      new RewardedAdLoadCallback() {
+                          @Override
+                          public void onAdLoaded(@NonNull RewardedAd ad) {
+                              rewardedAd = ad;
+                          }
+                      });
+              }
+
+              public class AdBridge {
+                  @JavascriptInterface
+                  public void show(String kind) {
+                      runOnUiThread(() -> {
+                          if ("interstitial".equals(kind) && interstitialAd != null) {
+                              interstitialAd.show(MainActivity.this);
+                              interstitialAd = null;
+                              loadInterstitial();
+                          } else if ("rewarded".equals(kind) && rewardedAd != null) {
+                              rewardedAd.show(MainActivity.this, rewardItem -> {});
+                              rewardedAd = null;
+                              loadRewarded();
+                          }
+                      });
+                  }
+              }
+          }
+          JAVAEOF
+
+      - name: Decode keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE_BASE64" | base64 -d > android/app/release.keystore
 
       - name: Configure release signing
         run: |
@@ -55,18 +171,18 @@ jobs:
           path = "android/app/build.gradle"
           with open(path) as f:
               content = f.read()
-          content = re.sub(r'(buildTypes\s*\{\s*release\s*\{)', r'\1\n            signingConfig signingConfigs.release', content, count=1)
           signing_block = '''
-              signingConfigs {
-                  release {
-                      storeFile file("release.keystore")
-                      storePassword System.getenv("KEYSTORE_PASSWORD")
-                      keyAlias System.getenv("KEY_ALIAS")
-                      keyPassword System.getenv("KEY_PASSWORD")
-                  }
+          signingConfigs {
+              release {
+                  storeFile file("release.keystore")
+                  storePassword System.getenv("KEYSTORE_PASSWORD")
+                  keyAlias System.getenv("KEY_ALIAS")
+                  keyPassword System.getenv("KEY_PASSWORD")
               }
+          }
           '''
           content = content.replace("android {", "android {" + signing_block, 1)
+          content = re.sub(r'(release\s*\{)', r'\1\n            signingConfig signingConfigs.release', content, count=1)
           with open(path, "w") as f:
               f.write(content)
           PYEOF
@@ -88,3 +204,4 @@ jobs:
         with:
           name: aao-seekho-english-release-apk
           path: android/app/build/outputs/apk/release/app-release.apk
+          
