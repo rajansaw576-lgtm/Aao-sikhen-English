@@ -23,8 +23,8 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Accept Android SDK licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
       - name: Install npm dependencies
         run: npm install
@@ -46,18 +46,18 @@ jobs:
           path = "android/app/build.gradle"
           with open(path) as f:
               content = f.read()
+          content = re.sub(r'(buildTypes\s*\{\s*release\s*\{)', r'\1\n            signingConfig signingConfigs.release', content, count=1)
           signing_block = '''
-          signingConfigs {
-              release {
-                  storeFile file("release.keystore")
-                  storePassword System.getenv("KEYSTORE_PASSWORD")
-                  keyAlias System.getenv("KEY_ALIAS")
-                  keyPassword System.getenv("KEY_PASSWORD")
+              signingConfigs {
+                  release {
+                      storeFile file("release.keystore")
+                      storePassword System.getenv("KEYSTORE_PASSWORD")
+                      keyAlias System.getenv("KEY_ALIAS")
+                      keyPassword System.getenv("KEY_PASSWORD")
+                  }
               }
-          }
           '''
           content = content.replace("android {", "android {" + signing_block, 1)
-          content = re.sub(r'(release\s*\{)', r'\1\n            signingConfig signingConfigs.release', content, count=1)
           with open(path, "w") as f:
               f.write(content)
           PYEOF
